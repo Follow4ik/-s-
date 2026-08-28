@@ -209,16 +209,75 @@ async def get_user(user_id: int):
 
 
 async def create_user(user_id: int, topic_id: int, username=None, full_name=None):
+    """Один user_id = одна запись. Старого пользователя не затираем."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            """INSERT OR REPLACE INTO users
+            """INSERT INTO users
                (user_id, topic_id, mode, banned, blocked_bot, warns, username, full_name,
                 msg_from_user, msg_from_group, created_at)
-               VALUES (?, ?, 'none', 0, 0, 0, ?, ?, 0, 0, ?)""",
+               VALUES (?, ?, 'none', 0, 0, 0, ?, ?, 0, 0, ?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 topic_id = excluded.topic_id,
+                 username = COALESCE(excluded.username, users.username),
+                 full_name = COALESCE(excluded.full_name, users.full_name)
+            """,
             (user_id, topic_id, username, full_name,
              datetime.now(KYIV).strftime("%Y-%m-%d %H:%M:%S")),
         )
         await db.commit()
+
+
+async def update_topic_id(user_id: int, topic_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE users SET topic_id = ? WHERE user_id = ?",
+            (topic_id, user_id),
+        )
+        await db.commit()
+
+
+async def topic_alive(topic_id: int) -> bool:
+    if not topic_id:
+        return False
+    try:
+        await bot.send_chat_action(
+            chat_id=GROUP_ID,
+            action="typing",
+            message_thread_id=int(topic_id),
+        )
+        return True
+    except Exception as e:
+        err = str(e).lower()
+        if "thread" in err or "topic" in err or "not found" in err:
+            return False
+        # другие ошибки сети не считаем что темы нет
+        return True
+
+
+async def ensure_topic_for_user(message: Message, user: dict | None) -> int:
+    """Всегда одна тема на один Telegram ID."""
+    user_id = message.from_user.id
+    if user and user.get("topic_id"):
+        tid = int(user["topic_id"])
+        if await topic_alive(tid):
+            await create_user(
+                user_id, tid,
+                message.from_user.username, message.from_user.full_name,
+            )
+            return tid
+    topic_id = await create_topic(message)
+    if user:
+        await update_topic_id(user_id, topic_id)
+        await create_user(
+            user_id, topic_id,
+            message.from_user.username, message.from_user.full_name,
+        )
+    else:
+        await create_user(
+            user_id, topic_id,
+            message.from_user.username, message.from_user.full_name,
+        )
+    return topic_id
 
 
 async def update_mode(user_id: int, mode: str):
@@ -760,8 +819,9 @@ async def do_broadcast(message: Message, user_ids: list):
     if not user_ids:
         await message.answer("Нет пользователей для рассылки.", reply_markup=admin_kb())
         return
+    started = datetime.now(KYIV).strftime("%d.%m.%Y %H:%M:%S")
     ok = fail = 0
-    status = await message.answer(f"Рассылка 0/{len(user_ids)}")
+    status = await message.answer(f"Рассылка запущена\n{started}")
     for i, uid in enumerate(user_ids, 1):
         try:
             await message.copy_to(uid)
@@ -774,11 +834,13 @@ async def do_broadcast(message: Message, user_ids: list):
             fail += 1
         if i % 15 == 0:
             try:
-                await status.edit_text(f"Рассылка {i}/{len(user_ids)}")
+                await status.edit_text(f"Рассылка запущена\n{started}\n{i}/{len(user_ids)}")
             except Exception:
                 pass
             await asyncio.sleep(0.05)
-    await status.edit_text(f"Готово\nУспешно: {ok}\nОшибок: {fail}")
+    await status.edit_text(
+        f"💥 Рассылка отправлена успешно!\n{started}\nУспешно: {ok}\nОшибок: {fail}"
+    )
     await message.answer("Панель", reply_markup=admin_kb())
 
 
@@ -955,28 +1017,16 @@ async def private_msg(message: Message, state: FSMContext):
     if message.text and await handle_user_menu(message, user):
         return
 
-    if not user or not user.get("topic_id"):
-        try:
-            topic_id = await create_topic(message)
-            await create_user(
-                user_id, topic_id,
-                message.from_user.username, message.from_user.full_name,
-            )
-            # В тему НЕ пишем юз и ID — только приветствие пользователю
-            await message.answer(WELCOME_TEXT, reply_markup=mode_kb())
-            if message.text and not message.text.startswith("/"):
-                await copy_to_topic(message, topic_id)
-                await inc_msg(user_id, from_user=True)
-            elif message.content_type != ContentType.TEXT:
-                await copy_to_topic(message, topic_id)
-                await inc_msg(user_id, from_user=True)
-        except Exception:
-            logger.exception("create topic")
-            await message.answer("Ошибка. Попробуй позже.")
+    try:
+        topic_id = await ensure_topic_for_user(message, user)
+    except Exception:
+        logger.exception("ensure topic")
+        await message.answer("Ошибка. Попробуй позже.")
         return
 
-    topic_id = user["topic_id"]
-    if user.get("mode") == "none":
+    user = await get_user(user_id)
+
+    if not user or user.get("mode") in (None, "none"):
         await message.answer(WELCOME_TEXT, reply_markup=mode_kb())
         await copy_to_topic(message, topic_id)
         return
