@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import logging
+import os
 import re
 from datetime import datetime, timezone, timedelta
 
@@ -15,10 +16,12 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.enums import ParseMode
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
-BOT_TOKEN = "8828150896:AAFYjY_z2bfxiep6FCwENTQGQfJwVOsWEpU"
-GROUP_ID = -1004486903203
-PANEL_PASSWORD = "hrbrbrbrbbxbrbdhyfnrbrfb"
-SUPPORT_BOT = "@tehpoddershka67_bot"
+# Для хостинга: задай переменные окружения BOT_TOKEN, GROUP_ID, PANEL_PASSWORD
+# Локально работают значения по умолчанию
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8828150896:AAFYjY_z2bfxiep6FCwENTQGQfJwVOsWEpU")
+GROUP_ID = int(os.getenv("GROUP_ID", "-1004486903203"))
+PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "imprizrakatmetg13sudskyalediomikezetazeronobstovjdnd")
+SUPPORT_BOT = os.getenv("SUPPORT_BOT", "@tehpoddershka67_bot")
 
 WELCOME_TEXT = """Здравствуй, с тобой на связи бот «небо отчуждение»
 
@@ -59,6 +62,12 @@ class PanelStates(StatesGroup):
     waiting_edit_stats = State()
     waiting_add_admin = State()
     waiting_del_admin = State()
+    waiting_tester = State()
+    waiting_hi_tag = State()
+    waiting_hi_text = State()
+    waiting_note_tag = State()
+    waiting_note_text = State()
+
 
 
 # ==================== DB ====================
@@ -122,7 +131,73 @@ async def init_db():
                 value INTEGER
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS msg_map (
+                user_id INTEGER,
+                user_msg_id INTEGER,
+                group_msg_id INTEGER,
+                topic_id INTEGER,
+                PRIMARY KEY (user_id, user_msg_id)
+            )
+        """)
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_msg_map_group ON msg_map(group_msg_id)"
+        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS testers (
+                name TEXT PRIMARY KEY,
+                on_rest INTEGER DEFAULT 0
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_hi (
+                tag_key TEXT PRIMARY KEY,
+                tag TEXT,
+                greeting TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS admin_notes (
+                tag_key TEXT PRIMARY KEY,
+                tag TEXT,
+                note TEXT
+            )
+        """)
         await db.commit()
+
+
+
+async def save_msg_map(user_id: int, user_msg_id: int, group_msg_id: int, topic_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO msg_map
+               (user_id, user_msg_id, group_msg_id, topic_id)
+               VALUES (?, ?, ?, ?)""",
+            (user_id, user_msg_id, group_msg_id, topic_id),
+        )
+        await db.commit()
+
+
+async def get_map_by_user_msg(user_id: int, user_msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM msg_map WHERE user_id = ? AND user_msg_id = ?",
+            (user_id, user_msg_id),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def get_map_by_group_msg(group_msg_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM msg_map WHERE group_msg_id = ?",
+            (group_msg_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
 
 
 async def get_user(user_id: int):
@@ -413,7 +488,139 @@ async def list_all_topics(limit=30):
             return [dict(r) for r in await cur.fetchall()]
 
 
+
+async def list_testers():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT name, on_rest FROM testers ORDER BY name") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def set_tester(name: str, on_rest: bool):
+    name = name.strip()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO testers (name, on_rest) VALUES (?, ?)",
+            (name, 1 if on_rest else 0),
+        )
+        await db.commit()
+
+
+async def del_tester(name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM testers WHERE name = ?", (name.strip(),))
+        await db.commit()
+
+
+def format_testers(rows):
+    if not rows:
+        return "Ресты:\nПока никого нет."
+    lines = ["Ресты:\n"]
+    for r in rows:
+        status = "в ресте" if r["on_rest"] else "не в ресте"
+        lines.append(f"• {r['name']} — {status}")
+    return "\n".join(lines)
+
+
+
+def norm_tag(tag: str) -> str:
+    return (tag or "").strip().lstrip("#").casefold()
+
+
+async def set_admin_hi(tag: str, greeting: str):
+    key = norm_tag(tag)
+    display = (tag or "").strip().lstrip("#")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admin_hi (tag_key, tag, greeting) VALUES (?, ?, ?)",
+            (key, display, greeting),
+        )
+        await db.commit()
+
+
+async def get_admin_hi(tag: str):
+    key = norm_tag(tag)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT tag, greeting FROM admin_hi WHERE tag_key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def list_admin_hi():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT tag, greeting FROM admin_hi ORDER BY tag") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def del_admin_hi(tag: str):
+    key = norm_tag(tag)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM admin_hi WHERE tag_key = ?", (key,))
+        await db.commit()
+
+
+async def set_admin_note(tag: str, note: str):
+    key = norm_tag(tag)
+    display = (tag or "").strip().lstrip("#")
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admin_notes (tag_key, tag, note) VALUES (?, ?, ?)",
+            (key, display, note),
+        )
+        await db.commit()
+
+
+async def get_admin_note(tag: str):
+    key = norm_tag(tag)
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT tag, note FROM admin_notes WHERE tag_key = ?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else None
+
+
+async def list_admin_notes():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT tag, note FROM admin_notes ORDER BY tag") as cur:
+            return [dict(r) for r in await cur.fetchall()]
+
+
+async def del_admin_note(tag: str):
+    key = norm_tag(tag)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM admin_notes WHERE tag_key = ?", (key,))
+        await db.commit()
+
+
 # ==================== KEYBOARDS ====================
+
+
+BTN_REVIEW = "Оставить отзыв"
+BTN_TESTS = "Ресты"
+BTN_SITE = "Наш сайт"
+BTN_NOTES = "Заметки"
+
+USER_MENU_BUTTONS = {BTN_REVIEW, BTN_TESTS, BTN_SITE, BTN_NOTES}
+
+REVIEWS_BOT = "@sky_of_Alienation_reviews"
+
+
+def user_menu_kb():
+    b = ReplyKeyboardBuilder()
+    b.button(text=BTN_REVIEW)
+    b.button(text=BTN_TESTS)
+    b.button(text=BTN_SITE)
+    b.button(text=BTN_NOTES)
+    b.adjust(1, 1, 1, 1)
+    return b.as_markup(resize_keyboard=True)
+
 
 def mode_kb():
     b = InlineKeyboardBuilder()
@@ -433,6 +640,9 @@ def admin_kb():
     b.button(text="Править статистику", callback_data="admin:edit_stats")
     b.button(text="Админы", callback_data="admin:admins")
     b.button(text="Ветки", callback_data="admin:topics")
+    b.button(text="Ресты", callback_data="admin:testers")
+    b.button(text="Приветствия /hi", callback_data="admin:hi")
+    b.button(text="Заметки админов", callback_data="admin:notes")
     b.button(text="Закрыть", callback_data="admin:close")
     b.adjust(1)
     return b.as_markup()
@@ -505,19 +715,45 @@ async def rename_topic(topic_id: int, new_name: str):
 
 async def copy_to_topic(message: Message, topic_id: int):
     try:
-        await message.copy_to(chat_id=GROUP_ID, message_thread_id=topic_id)
+        mid = await message.copy_to(chat_id=GROUP_ID, message_thread_id=topic_id)
+        await save_msg_map(
+            message.from_user.id, message.message_id, mid.message_id, topic_id
+        )
     except Exception as e:
         logger.error(f"copy topic: {e}")
 
 
 async def copy_to_user(message: Message, user_id: int):
     try:
-        await message.copy_to(chat_id=user_id)
+        mid = await message.copy_to(chat_id=user_id)
+        await save_msg_map(
+            user_id, mid.message_id, message.message_id, message.message_thread_id
+        )
         await mark_active(user_id)
     except TelegramForbiddenError:
         await set_blocked_bot(user_id, True)
     except Exception as e:
         logger.error(f"copy user: {e}")
+
+
+async def apply_edit(chat_id: int, message_id: int, src: Message):
+    try:
+        if src.text is not None:
+            await bot.edit_message_text(
+                text=src.text,
+                chat_id=chat_id,
+                message_id=message_id,
+                entities=src.entities,
+            )
+        elif src.caption is not None:
+            await bot.edit_message_caption(
+                chat_id=chat_id,
+                message_id=message_id,
+                caption=src.caption,
+                caption_entities=src.caption_entities,
+            )
+    except Exception as e:
+        logger.error(f"apply_edit: {e}")
 
 
 async def do_broadcast(message: Message, user_ids: list):
@@ -632,6 +868,53 @@ async def check_text_spam(user_id: int, text: str, topic_id: int) -> bool:
     return False
 
 
+
+async def handle_user_menu(message: Message, user: dict) -> bool:
+    text = (message.text or "").strip()
+    if text not in USER_MENU_BUTTONS:
+        return False
+
+    if text == BTN_REVIEW:
+        await message.answer(
+            f"Оставьте отзыв тут: {REVIEWS_BOT}",
+            reply_markup=user_menu_kb(),
+        )
+        return True
+
+    if text == BTN_TESTS:
+        rows = await list_testers()
+        await message.answer(format_testers(rows), reply_markup=user_menu_kb())
+        return True
+
+    if text == BTN_SITE:
+        await message.answer(
+            "Сайт находится в разработке",
+            reply_markup=user_menu_kb(),
+        )
+        return True
+
+    if text == BTN_NOTES:
+        rows = await list_admin_notes()
+        if not rows:
+            await message.answer(
+                "Заметок пока нет.",
+                reply_markup=user_menu_kb(),
+            )
+            return True
+        b = InlineKeyboardBuilder()
+        for r in rows:
+            tag = r.get("tag") or "?"
+            b.button(text=f"#{tag}", callback_data=f"unote:{norm_tag(tag)}")
+        b.adjust(1)
+        await message.answer(
+            "Заметки. Выбери админа:",
+            reply_markup=b.as_markup(),
+        )
+        return True
+
+    return False
+
+
 # ==================== USER HANDLERS ====================
 
 @router.message(CommandStart(), F.chat.type == "private", StateFilter(None))
@@ -668,6 +951,9 @@ async def private_msg(message: Message, state: FSMContext):
         return
 
     await mark_active(user_id)
+
+    if message.text and await handle_user_menu(message, user):
+        return
 
     if not user or not user.get("topic_id"):
         try:
@@ -708,6 +994,21 @@ async def private_msg(message: Message, state: FSMContext):
     await inc_msg(user_id, from_user=True)
 
 
+
+@router.callback_query(F.data.startswith("unote:"))
+async def user_note_view(callback: CallbackQuery):
+    tag = callback.data.split(":", 1)[1]
+    row = await get_admin_note(tag)
+    if not row:
+        await callback.answer("Заметки нет", show_alert=True)
+        return
+    await callback.message.answer(
+        f"Заметки #{row['tag']}\n\n{row['note']}",
+        reply_markup=user_menu_kb(),
+    )
+    await callback.answer()
+
+
 @router.callback_query(F.data.startswith("mode:"))
 async def mode_choice(callback: CallbackQuery):
     mode = callback.data.split(":")[1]
@@ -738,7 +1039,7 @@ async def mode_choice(callback: CallbackQuery):
     base = (callback.from_user.full_name or "User")[:30]
     unique = f"{base} | {name} | {callback.from_user.id}"[:128]
     await rename_topic(user["topic_id"], unique)
-    await callback.message.answer(txt)
+    await callback.message.answer(txt, reply_markup=user_menu_kb())
     try:
         await bot.send_message(
             GROUP_ID, topic_txt,
@@ -749,8 +1050,9 @@ async def mode_choice(callback: CallbackQuery):
     try:
         await bot.send_message(
             GROUP_ID,
-            f"калл 🔔 Новый пользователь — <b>{name}</b>",
+            f"🔔 Новый пользователь — <b>{name}</b>",
             parse_mode=ParseMode.HTML,
+            disable_notification=False,
         )
     except Exception:
         pass
@@ -862,6 +1164,24 @@ async def group_msg(message: Message):
             await message.reply(f"Варн выдан. Всего: {warns}/10")
         return
 
+    # /hi рихтер  — отправить пользователю приветствие админа
+    low = text.lower()
+    if low.startswith("/hi ") or low.startswith("hi "):
+        tag = text.split(maxsplit=1)[1].strip()
+        row = await get_admin_hi(tag)
+        if not row or not row.get("greeting"):
+            await message.reply("Приветствие для этого тега не задано. Задай его в /panel.")
+            return
+        try:
+            await bot.send_message(user_id, row["greeting"])
+            await message.reply(f"Приветствие #{row.get('tag') or tag} отправлено пользователю.")
+        except TelegramForbiddenError:
+            await set_blocked_bot(user_id, True)
+            await message.reply("Пользователь заблокировал бота.")
+        except Exception as e:
+            await message.reply(f"Не отправилось: {e}")
+        return
+
     # Привязка админа: /tag Z_K
     if text.lower().startswith("/tag "):
         t = text.split(maxsplit=1)[1].strip().lstrip("#").upper()
@@ -875,6 +1195,30 @@ async def group_msg(message: Message):
 
     await copy_to_user(message, user_id)
     await inc_msg(user_id, from_user=False)
+
+
+
+@router.edited_message(F.chat.type == "private")
+async def edited_private(message: Message):
+    user = await get_user(message.from_user.id)
+    if not user or user.get("banned"):
+        return
+    if await is_muted(message.from_user.id):
+        return
+    mapped = await get_map_by_user_msg(message.from_user.id, message.message_id)
+    if not mapped:
+        return
+    await apply_edit(GROUP_ID, mapped["group_msg_id"], message)
+
+
+@router.edited_message(F.chat.id == GROUP_ID)
+async def edited_group(message: Message):
+    if message.from_user and message.from_user.is_bot:
+        return
+    mapped = await get_map_by_group_msg(message.message_id)
+    if not mapped:
+        return
+    await apply_edit(mapped["user_id"], mapped["user_msg_id"], message)
 
 
 # ==================== ADMIN PANEL ====================
@@ -1129,6 +1473,175 @@ async def admin_del_do(message: Message, state: FSMContext):
     await del_admin(tag)
     await message.answer(f"Админ #{tag} удалён.", reply_markup=admin_kb())
     await state.clear()
+
+
+
+
+
+@router.callback_query(F.data == "admin:notes")
+async def admin_notes_start(callback: CallbackQuery, state: FSMContext):
+    rows = await list_admin_notes()
+    lines = ["Заметки админов:\n"]
+    if rows:
+        for r in rows:
+            preview = (r.get("note") or "")[:80]
+            lines.append(f"#{r['tag']}: {preview}")
+    else:
+        lines.append("Пока пусто.")
+    lines.append("\nВведи тег админа, например: #рихтер\nИли удалить рихтер\nИли Отмена")
+    await state.set_state(PanelStates.waiting_note_tag)
+    await callback.message.answer("\n".join(lines), reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.message(PanelStates.waiting_note_tag, F.text)
+async def admin_note_tag(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    if raw == "Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=admin_kb())
+        return
+    if raw.lower().startswith("удалить "):
+        tag = raw.split(" ", 1)[1].strip()
+        await del_admin_note(tag)
+        await state.clear()
+        await message.answer(f"Заметки #{norm_tag(tag)} удалены.", reply_markup=admin_kb())
+        return
+    tag = raw.lstrip("#").strip()
+    if not tag:
+        await message.answer("Введи тег, например #рихтер")
+        return
+    await state.update_data(note_tag=tag)
+    await state.set_state(PanelStates.waiting_note_text)
+    await message.answer(
+        f"Админ: #{tag}\nТеперь пришли текст заметки для пользователей.\nИли Отмена",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(PanelStates.waiting_note_text)
+async def admin_note_text(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=admin_kb())
+        return
+    data = await state.get_data()
+    tag = data.get("note_tag")
+    note = message.text or message.caption
+    if not tag or not note:
+        await message.answer("Нужен текст заметки.")
+        return
+    await set_admin_note(tag, note)
+    await state.clear()
+    await message.answer(
+        f"Заметка для #{tag} сохранена. Пользователи увидят её в кнопке Заметки.",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:hi")
+async def admin_hi_start(callback: CallbackQuery, state: FSMContext):
+    rows = await list_admin_hi()
+    lines = ["Приветствия админов (/hi):\n"]
+    if rows:
+        for r in rows:
+            preview = (r.get("greeting") or "")[:80]
+            lines.append(f"#{r['tag']}: {preview}")
+    else:
+        lines.append("Пока пусто.")
+    lines.append("\nВведи тег, например: #рихтер\nИли удалить рихтер\nИли Отмена")
+    await state.set_state(PanelStates.waiting_hi_tag)
+    await callback.message.answer("\n".join(lines), reply_markup=cancel_kb())
+    await callback.answer()
+
+
+@router.message(PanelStates.waiting_hi_tag, F.text)
+async def admin_hi_tag(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    if raw == "Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=admin_kb())
+        return
+    if raw.lower().startswith("удалить "):
+        tag = raw.split(" ", 1)[1].strip()
+        await del_admin_hi(tag)
+        await state.clear()
+        await message.answer(f"Приветствие #{norm_tag(tag)} удалено.", reply_markup=admin_kb())
+        return
+    tag = raw.lstrip("#").strip()
+    if not tag:
+        await message.answer("Введи тег, например #рихтер")
+        return
+    await state.update_data(hi_tag=tag)
+    await state.set_state(PanelStates.waiting_hi_text)
+    await message.answer(
+        f"Тег: #{tag}\nТеперь пришли текст приветствия для пользователя.\nИли Отмена",
+        reply_markup=cancel_kb(),
+    )
+
+
+@router.message(PanelStates.waiting_hi_text)
+async def admin_hi_text(message: Message, state: FSMContext):
+    if (message.text or "").strip() == "Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=admin_kb())
+        return
+    data = await state.get_data()
+    tag = data.get("hi_tag")
+    greeting = message.text or message.caption
+    if not tag or not greeting:
+        await message.answer("Нужен текст приветствия.")
+        return
+    await set_admin_hi(tag, greeting)
+    await state.clear()
+    await message.answer(
+        f"Готово. В теме пиши: /hi {tag}",
+        reply_markup=admin_kb(),
+    )
+
+
+@router.callback_query(F.data == "admin:testers")
+async def admin_testers(callback: CallbackQuery, state: FSMContext):
+    rows = await list_testers()
+    await state.set_state(PanelStates.waiting_tester)
+    await callback.message.answer(
+        format_testers(rows) + "\n\n"
+        "Обновить:\n"
+        "Имя rest — в ресте\n"
+        "Имя active — не в ресте\n"
+        "удалить Имя — убрать\n"
+        "Или Отмена",
+        reply_markup=cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(PanelStates.waiting_tester, F.text)
+async def admin_testers_do(message: Message, state: FSMContext):
+    raw = message.text.strip()
+    if raw == "Отмена":
+        await state.clear()
+        await message.answer("Отменено", reply_markup=admin_kb())
+        return
+    low = raw.lower()
+    if low.startswith("удалить "):
+        name = raw.split(" ", 1)[1].strip()
+        await del_tester(name)
+        await state.clear()
+        await message.answer(f"Удалён: {name}", reply_markup=admin_kb())
+        return
+    parts = raw.rsplit(" ", 1)
+    if len(parts) != 2 or parts[1].lower() not in ("rest", "active", "рест"):
+        await message.answer("Формат: Имя rest   или   Имя active   или   удалить Имя")
+        return
+    name, st = parts[0].strip(), parts[1].lower()
+    on_rest = st in ("rest", "рест")
+    await set_tester(name, on_rest)
+    await state.clear()
+    await message.answer(
+        f"{name}: {'в ресте' if on_rest else 'не в ресте'}",
+        reply_markup=admin_kb(),
+    )
 
 
 @router.callback_query(F.data == "admin:topics")
