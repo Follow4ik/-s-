@@ -41,7 +41,7 @@ WELCOME_TEXT = """Здравствуй, с тобой на связи бот «�
 
 Прошу выбрать, какая категория тебе нужна:"""
 
-DB_PATH = "bot_data.db"
+DB_PATH = os.getenv("DB_PATH", "bot_data.db")
 KYIV = timezone(timedelta(hours=3))
 
 logging.basicConfig(level=logging.INFO)
@@ -225,7 +225,6 @@ async def create_user(user_id: int, topic_id: int, username=None, full_name=None
                 msg_from_user, msg_from_group, created_at)
                VALUES (?, ?, 'none', 0, 0, 0, ?, ?, 0, 0, ?)
                ON CONFLICT(user_id) DO UPDATE SET
-                 topic_id = excluded.topic_id,
                  username = COALESCE(excluded.username, users.username),
                  full_name = COALESCE(excluded.full_name, users.full_name)
             """,
@@ -244,48 +243,17 @@ async def update_topic_id(user_id: int, topic_id: int):
         await db.commit()
 
 
-async def topic_alive(topic_id: int) -> bool:
-    if not topic_id:
-        return False
-    try:
-        await bot.send_chat_action(
-            chat_id=GROUP_ID,
-            action="typing",
-            message_thread_id=int(topic_id),
-        )
-        return True
-    except Exception as e:
-        err = str(e).lower()
-        if "thread" in err or "topic" in err or "not found" in err:
-            return False
-        # другие ошибки сети не считаем что темы нет
-        return True
-
-
-async def ensure_topic_for_user(message: Message, user: dict | None) -> int:
-    """Всегда одна тема на один Telegram ID."""
+async def ensure_topic_for_user(message: Message, user: dict | None) -> tuple:
+    """Один Telegram ID = одна тема. Новую не создаём, если ID уже есть в базе."""
     user_id = message.from_user.id
     if user and user.get("topic_id"):
-        tid = int(user["topic_id"])
-        if await topic_alive(tid):
-            await create_user(
-                user_id, tid,
-                message.from_user.username, message.from_user.full_name,
-            )
-            return tid
+        return int(user["topic_id"]), False
     topic_id = await create_topic(message)
-    if user:
-        await update_topic_id(user_id, topic_id)
-        await create_user(
-            user_id, topic_id,
-            message.from_user.username, message.from_user.full_name,
-        )
-    else:
-        await create_user(
-            user_id, topic_id,
-            message.from_user.username, message.from_user.full_name,
-        )
-    return topic_id
+    await create_user(
+        user_id, topic_id,
+        message.from_user.username, message.from_user.full_name,
+    )
+    return topic_id, True
 
 
 async def update_mode(user_id: int, mode: str):
@@ -1049,7 +1017,7 @@ async def private_msg(message: Message, state: FSMContext):
         return
 
     try:
-        topic_id = await ensure_topic_for_user(message, user)
+        topic_id, is_new = await ensure_topic_for_user(message, user)
     except Exception:
         logger.exception("ensure topic")
         await message.answer("Ошибка. Попробуй позже.", reply_markup=user_menu_kb())
@@ -1057,9 +1025,18 @@ async def private_msg(message: Message, state: FSMContext):
 
     user = await get_user(user_id)
 
-    if not user or user.get("mode") in (None, "none"):
+    if is_new or (user and user.get("mode") in (None, "none") and is_new):
         await message.answer(WELCOME_TEXT, reply_markup=mode_kb())
-        await message.answer("Меню всегда внизу.", reply_markup=user_menu_kb())
+        if message.text and not message.text.startswith("/"):
+            await copy_to_topic(message, topic_id)
+            await inc_msg(user_id, from_user=True)
+        elif message.content_type != ContentType.TEXT:
+            await copy_to_topic(message, topic_id)
+            await inc_msg(user_id, from_user=True)
+        return
+
+    if user and user.get("mode") in (None, "none"):
+        await message.answer(WELCOME_TEXT, reply_markup=mode_kb())
         await copy_to_topic(message, topic_id)
         return
 
