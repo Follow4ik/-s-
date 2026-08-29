@@ -18,8 +18,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 # Для хостинга: задай переменные окружения BOT_TOKEN, GROUP_ID, PANEL_PASSWORD
 # Локально работают значения по умолчанию
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8828150896:AAFYjY_z2bfxiep6FCwENTQGQfJwVOsWEpU")
-GROUP_ID = int(os.getenv("GROUP_ID", "-1004486903203"))
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8283872591:AAHJEC5WM9Mmcilc6-sE3wC7sIbgCDLQPQg")
+GROUP_ID = int(os.getenv("GROUP_ID", "-1003797535271"))
 PANEL_PASSWORD = os.getenv("PANEL_PASSWORD", "imprizrakatmetg13sudskyalediomikezetazeronobstovjdnd")
 SUPPORT_BOT = os.getenv("SUPPORT_BOT", "@tehpoddershka67_bot")
 
