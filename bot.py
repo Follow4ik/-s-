@@ -67,6 +67,7 @@ class PanelStates(StatesGroup):
     waiting_hi_text = State()
     waiting_note_tag = State()
     waiting_note_text = State()
+    waiting_user_note = State()
 
 
 
@@ -161,6 +162,13 @@ async def init_db():
                 tag_key TEXT PRIMARY KEY,
                 tag TEXT,
                 note TEXT
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS user_notes (
+                user_id INTEGER PRIMARY KEY,
+                note TEXT,
+                updated_at TEXT
             )
         """)
         await db.commit()
@@ -658,6 +666,32 @@ async def del_admin_note(tag: str):
         await db.commit()
 
 
+
+async def get_user_note(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT note FROM user_notes WHERE user_id = ?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def set_user_note(user_id: int, note: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """INSERT OR REPLACE INTO user_notes (user_id, note, updated_at)
+               VALUES (?, ?, ?)""",
+            (user_id, note, datetime.now(KYIV).strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        await db.commit()
+
+
+async def del_user_note(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM user_notes WHERE user_id = ?", (user_id,))
+        await db.commit()
+
+
 # ==================== KEYBOARDS ====================
 
 
@@ -956,22 +990,17 @@ async def handle_user_menu(message: Message, user: dict) -> bool:
         return True
 
     if text == BTN_NOTES:
-        rows = await list_admin_notes()
-        if not rows:
-            await message.answer(
-                "Заметок пока нет.",
-                reply_markup=user_menu_kb(),
-            )
-            return True
+        note = await get_user_note(message.from_user.id)
         b = InlineKeyboardBuilder()
-        for r in rows:
-            tag = r.get("tag") or "?"
-            b.button(text=f"#{tag}", callback_data=f"unote:{norm_tag(tag)}")
+        b.button(text="Написать / изменить", callback_data="unote:edit")
+        b.button(text="Удалить заметку", callback_data="unote:del")
         b.adjust(1)
-        await message.answer(
-            "Заметки. Выбери админа:",
-            reply_markup=b.as_markup(),
-        )
+        if note:
+            body = f"Твои заметки:\n\n{note}"
+        else:
+            body = "У тебя пока нет заметок.\nНажми «Написать / изменить»."
+        await message.answer(body, reply_markup=b.as_markup())
+        await message.answer("Меню", reply_markup=user_menu_kb())
         return True
 
     return False
@@ -1001,14 +1030,16 @@ async def private_msg(message: Message, state: FSMContext):
 
     if user and user.get("banned"):
         await message.answer(
-            f"Вы заблокированы в этом боте.\nОбратитесь в поддержку: {SUPPORT_BOT}"
+            f"Вы заблокированы в этом боте.\nОбратитесь в поддержку: {SUPPORT_BOT}",
+            reply_markup=user_menu_kb(),
         )
         return
 
     if await is_muted(user_id):
         await message.answer(
             "Вы сейчас в муте.\n"
-            f"Если хотите оспорить — напишите в техническую поддержку: {SUPPORT_BOT}"
+            f"Если хотите оспорить — напишите в техническую поддержку: {SUPPORT_BOT}",
+            reply_markup=user_menu_kb(),
         )
         return
 
@@ -1021,13 +1052,14 @@ async def private_msg(message: Message, state: FSMContext):
         topic_id = await ensure_topic_for_user(message, user)
     except Exception:
         logger.exception("ensure topic")
-        await message.answer("Ошибка. Попробуй позже.")
+        await message.answer("Ошибка. Попробуй позже.", reply_markup=user_menu_kb())
         return
 
     user = await get_user(user_id)
 
     if not user or user.get("mode") in (None, "none"):
         await message.answer(WELCOME_TEXT, reply_markup=mode_kb())
+        await message.answer("Меню всегда внизу.", reply_markup=user_menu_kb())
         await copy_to_topic(message, topic_id)
         return
 
@@ -1045,18 +1077,37 @@ async def private_msg(message: Message, state: FSMContext):
 
 
 
-@router.callback_query(F.data.startswith("unote:"))
-async def user_note_view(callback: CallbackQuery):
-    tag = callback.data.split(":", 1)[1]
-    row = await get_admin_note(tag)
-    if not row:
-        await callback.answer("Заметки нет", show_alert=True)
-        return
+@router.callback_query(F.data == "unote:edit")
+async def user_note_edit(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PanelStates.waiting_user_note)
     await callback.message.answer(
-        f"Заметки #{row['tag']}\n\n{row['note']}",
+        "Напиши заметку себе. Она видна только тебе.\nИли Отмена",
         reply_markup=user_menu_kb(),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "unote:del")
+async def user_note_del(callback: CallbackQuery):
+    await del_user_note(callback.from_user.id)
+    await callback.message.answer("Заметка удалена.", reply_markup=user_menu_kb())
+    await callback.answer()
+
+
+@router.message(PanelStates.waiting_user_note, F.text)
+async def user_note_save(message: Message, state: FSMContext):
+    raw = (message.text or "").strip()
+    if raw in ("Отмена", BTN_NOTES, BTN_REVIEW, BTN_TESTS, BTN_SITE):
+        await state.clear()
+        if raw in USER_MENU_BUTTONS:
+            user = await get_user(message.from_user.id)
+            await handle_user_menu(message, user)
+            return
+        await message.answer("Отменено", reply_markup=user_menu_kb())
+        return
+    await set_user_note(message.from_user.id, message.text)
+    await state.clear()
+    await message.answer("Заметка сохранена.", reply_markup=user_menu_kb())
 
 
 @router.callback_query(F.data.startswith("mode:"))
