@@ -757,10 +757,7 @@ def extract_admin_tag(text: str):
 
 
 async def create_topic(message: Message) -> int:
-    name = (message.from_user.full_name or "User")[:40]
-    if message.from_user.username:
-        name = f"{name} (@{message.from_user.username})"
-    name = f"{name} [{message.from_user.id}]"[:128]
+    name = (message.from_user.full_name or "User")[:128]
     topic = await bot.create_forum_topic(chat_id=GROUP_ID, name=name)
     return topic.message_thread_id
 
